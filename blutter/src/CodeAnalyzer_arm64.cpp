@@ -184,6 +184,13 @@ static inline void handleDecompressPointer(AsmIterator& insn, arm64_reg reg) {
 	++insn;
 }
 
+static inline void handleExtraDecompressPointer(AsmIterator& insn, arm64_reg reg) {
+	if (insn.id() != ARM64_INS_ADD) return;
+	if (!(insn.ops(0).reg == insn.ops(1).reg && insn.ops(0).reg == reg)) return;
+	if (!(insn.ops(2).reg == CSREG_DART_HEAP && insn.ops(2).shift.value == 32)) return;
+	++insn;
+}
+
 struct ILResult {
 	cs_insn* lastIns{ nullptr };
 	std::unique_ptr<ILInstr> il;
@@ -515,6 +522,7 @@ if (target != 0) {
 std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(AsmIterator& insn)
 {
 	// CCallInstr::EmitNativeCode()
+	// Note: since Dart 3.5, CCallInstr::EmitNativeCode() is removed
 	if (insn.id() == ARM64_INS_AND && insn.ops(0).reg == CSREG_DART_SP && insn.ops(1).reg == CSREG_DART_SP && insn.ops(2).imm == 0xfffffffffffffff0) {
 		// previous IL must be EnterFrame
 		//INSN_ASSERT(fnInfo->LastIL()->Kind() == ILInstr::EnterFrame);
@@ -522,6 +530,7 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 		if (fnInfo->LastIL()->Kind() == ILInstr::EnterFrame) {
 			InsnMarker marker(insn);
 			++insn;
+			// LeafRuntimeScope::Call()
 			if (insn.id() == ARM64_INS_MOV && insn.ops(0).reg == ARM64_REG_SP && insn.ops(1).reg == CSREG_DART_SP) {
 				++insn;
 
@@ -542,6 +551,7 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 
 				INSN_ASSERT(insn.IsMovz());
 				INSN_ASSERT(insn.ops(0).reg == CSREG_DART_TMP);
+				INSN_ASSERT(insn.ops(1).imm == dart::VMTag::kDartTagId);
 				++insn;
 
 				INSN_ASSERT(insn.id() == ARM64_INS_STR);
@@ -642,9 +652,30 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 		INSN_ASSERT(insn.ops(1).reg == CSREG_DART_SP);
 		++insn;
 
+		// since Dart 3.5, compiler save call target to THR::vm_tag (similar to LeafRuntimeScope::Call())
+		bool save_to_vm_tag = false;
+		if (insn.id() == ARM64_INS_STR) {
+			INSN_ASSERT(insn.ops(0).reg == call_target_reg);
+			INSN_ASSERT(insn.ops(1).mem.base == CSREG_DART_THR && insn.ops(1).mem.disp == AOT_Thread_vm_tag_offset);
+			++insn;
+			save_to_vm_tag = true;
+		}
+		
 		INSN_ASSERT(insn.id() == ARM64_INS_BLR);
 		INSN_ASSERT(insn.ops(0).reg == call_target_reg);
 		++insn;
+
+		if (save_to_vm_tag) {
+			INSN_ASSERT(insn.IsMovz());
+			INSN_ASSERT(insn.ops(0).reg == CSREG_DART_TMP);
+			INSN_ASSERT(insn.ops(1).imm == dart::VMTag::kDartTagId);
+			++insn;
+
+			INSN_ASSERT(insn.id() == ARM64_INS_STR);
+			INSN_ASSERT(insn.ops(0).reg == CSREG_DART_TMP);
+			INSN_ASSERT(insn.ops(1).mem.base == CSREG_DART_THR && insn.ops(1).mem.disp == AOT_Thread_vm_tag_offset);
+			++insn;
+		}
 
 		INSN_ASSERT(insn.id() == ARM64_INS_MOV);
 		INSN_ASSERT(insn.ops(0).reg == ARM64_REG_SP);
@@ -1438,7 +1469,7 @@ void FunctionAnalyzer::handleArgumentsDescriptorTypeArguments(AsmIterator& insn)
 	const auto typeArgLenReg = ToCapstoneReg(insn.ops(0).reg);
 	++insn;
 
-	handleDecompressPointer(insn, typeArgLenReg);
+	handleExtraDecompressPointer(insn, typeArgLenReg);
 
 	const auto storeTypeArgLenRes = handleStoreLocal(insn, typeArgLenReg);
 	if (storeTypeArgLenRes.fpOffset != 0) {
@@ -1481,7 +1512,7 @@ void FunctionAnalyzer::handleArgumentsDescriptorTypeArguments(AsmIterator& insn)
 	fnInfo->State()->ClearRegister(sizeReg);
 	++insn;
 
-	handleDecompressPointer(insn, sizeReg);
+	handleExtraDecompressPointer(insn, sizeReg);
 
 	INSN_ASSERT(insn.id() == ARM64_INS_ADD);
 	INSN_ASSERT(insn.ops(1).reg == CSREG_DART_FP);
@@ -1664,6 +1695,7 @@ std::unique_ptr<SetupParametersInstr> FunctionAnalyzer::processPrologueParameter
 	//   these ILs will be appended after Prologue IL even the assembly is before the prologue ends
 	// Note: with method extractors optmization (since Dart 3.4), arguments might pass via registers (R1, R2, R3).
 	//   now, only see in closure and async method.
+	// since Dart 3.5, compiler does not generate decompress pointer instruction for small int (such as parameter count)
 	auto optionalParamCntReg = ARM64_REG_INVALID;
 	auto firstParamReg = ARM64_REG_INVALID;
 	InsnMarker marker(insn);
@@ -1804,7 +1836,7 @@ std::unique_ptr<SetupParametersInstr> FunctionAnalyzer::processPrologueParameter
 			++insn;
 
 			// the value is Smi object. so decompress pointer instruction is generated automatically even it is not needed.
-			handleDecompressPointer(insn, paramCntReg);
+			handleExtraDecompressPointer(insn, paramCntReg);
 
 			ASSERT(fnInfo->useFramePointer);
 
@@ -2261,6 +2293,7 @@ std::unique_ptr<InitAsyncInstr> FunctionAnalyzer::processInitAsyncInstr(AsmItera
 				fnInfo->returnType = returnType;
 				const auto start = il->Start();
 				fnInfo->RemoveLastIL();
+				setAsmTextDataCall(insn.address(), (uint64_t)insn.ops(0).imm);
 				++insn;
 				return std::make_unique<InitAsyncInstr>(insn.Wrap(start), returnType);
 			}
@@ -2468,6 +2501,7 @@ std::unique_ptr<TestTypeInstr> FunctionAnalyzer::processInstanceofNoTypeArgument
 			else { // typeCheckCid == dart::kNumberCid || typeCheckCid == 0 (object)
 				INSN_ASSERT(typeName == vtype->ToString() || dartStub->kind == DartStub::DefaultTypeTestStub || dartStub->kind == DartStub::DefaultNullableTypeTestStub);
 			}
+			setAsmTextDataCall(insn.address(), (uint64_t)insn.ops(0).imm);
 			++insn;
 		}
 		else {
@@ -2598,8 +2632,24 @@ std::unique_ptr<BoxInt64Instr> FunctionAnalyzer::processBoxInt64Instr(AsmIterato
 				INSN_ASSERT(stubKind == DartStub::AllocateMintSharedWithoutFPURegsStub || stubKind == DartStub::AllocateMintSharedWithFPURegsStub);
 			};
 
+			// since Dart 3.5, some function might omit EnterFrame at early of function but do it before calling (BL) here
+			bool doEnterFrame = false;
+			if (!fnInfo->useFramePointer) {
+				if (insn.id() == ARM64_INS_STP && insn.ops(0).reg == CSREG_DART_FP && insn.ops(1).reg == ARM64_REG_LR && insn.ops(2).mem.base == CSREG_DART_SP) {
+					INSN_ASSERT(insn.writeback());
+					++insn;
+
+					INSN_ASSERT(insn.id() == ARM64_INS_MOV);
+					INSN_ASSERT(insn.ops(0).reg == CSREG_DART_FP);
+					INSN_ASSERT(insn.ops(1).reg == CSREG_DART_SP);
+					++insn;
+					doEnterFrame = true;
+				}
+			}
+
 			if (insn.id() == ARM64_INS_BL) {
 				assertAllocateMintStub(app.GetFunction(insn.ops(0).imm));
+				setAsmTextDataCall(insn.address(), (uint64_t)insn.ops(0).imm);
 				++insn;
 			}
 			else {
@@ -2616,6 +2666,19 @@ std::unique_ptr<BoxInt64Instr> FunctionAnalyzer::processBoxInt64Instr(AsmIterato
 
 				INSN_ASSERT(insn.id() == ARM64_INS_BLR);
 				INSN_ASSERT(insn.ops(0).reg == CSREG_DART_LR);
+				++insn;
+			}
+
+			if (doEnterFrame) {
+				// MUST have LeaveFrame here
+				INSN_ASSERT(insn.id() == ARM64_INS_MOV && insn.ops(0).reg == CSREG_DART_SP && insn.ops(1).reg == CSREG_DART_FP);
+				++insn;
+
+				INSN_ASSERT(insn.id() == ARM64_INS_LDP && insn.op_count() == 4);
+				INSN_ASSERT(insn.ops(0).reg == CSREG_DART_FP);
+				INSN_ASSERT(insn.ops(1).reg == ARM64_REG_LR);
+				INSN_ASSERT(insn.ops(2).mem.base == CSREG_DART_SP);
+				INSN_ASSERT(insn.ops(3).imm == 0x10);
 				++insn;
 			}
 
@@ -2760,6 +2823,7 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadFieldTableInstr(AsmIterato
 						ASSERT(dartFn->IsStub());
 						const auto stubKind = reinterpret_cast<DartStub*>(dartFn)->kind;
 						INSN_ASSERT(stubKind == DartStub::InitLateStaticFieldStub || stubKind == DartStub::InitLateFinalStaticFieldStub);
+						setAsmTextDataCall(insn.address(), (uint64_t)insn.ops(0).imm);
 						++insn;
 					}
 					else {
@@ -2801,6 +2865,7 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadFieldTableInstr(AsmIterato
 					auto fn = app.GetFunction(insn2.ops(0).imm);
 					auto stub = fn->AsStub();
 					INSN_ASSERT(stub->kind == DartStub::LateInitializationErrorSharedWithoutFPURegsStub || stub->kind == DartStub::LateInitializationErrorSharedWithFPURegsStub);
+					setAsmTextDataCall(insn2.address(), (uint64_t)insn.ops(0).imm);
 					insn2.Next();
 					// load static field but throw an exception if it is not initialized
 					return std::make_unique<LoadStaticFieldInstr>(insn.Wrap(marker.Take()), dstReg, field_offset);
@@ -2987,6 +3052,7 @@ std::unique_ptr<WriteBarrierInstr> FunctionAnalyzer::processWriteBarrierInstr(As
 		const auto stubKind = reinterpret_cast<DartStub*>(stub)->kind;
 		INSN_ASSERT(stubKind == DartStub::WriteBarrierWrappersStub || stubKind == DartStub::ArrayWriteBarrierStub);
 		isArray = stubKind == DartStub::ArrayWriteBarrierStub;
+		setAsmTextDataCall(insn.address(), (uint64_t)insn.ops(0).imm);
 		++insn;
 	}
 	else {
